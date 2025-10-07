@@ -1,0 +1,9 @@
+[
+  {
+    "id": "안동하회탈",
+    "title": "안동하회탈",
+    "thumb": "../projects/demo/asset/Mask.thumb.png",
+    "open": "./index.html?cfg=projects/demo/config.json",
+    "meta": { "tags": ["heritage", "mask"], "date": "2025-10-07" }
+  }
+]

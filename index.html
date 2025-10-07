@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>3D Web Viewer (3DHOP-style config)</title>
+<link rel="icon" href="data:," />
+
+<!-- 예제 모듈들이 'three'를 참조 → 로컬 libs 경로로 매핑 -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "./libs/three.module.js"
+  }
+}
+</script>
+
+<style>
+  :root{--bg:#111;--fg:#eee;--panel:#1d1d1d;--accent:#4ea3ff}
+  html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--fg);font-family:system-ui,Segoe UI,Roboto,Arial}
+  #toolbar{position:fixed;top:10px;left:10px;z-index:10;display:flex;gap:8px;flex-wrap:wrap}
+  #toolbar button,#toolbar input[type="file"],#toolbar select{padding:8px 10px;border:0;border-radius:8px;background:#2a2a2a;color:#fff;cursor:pointer}
+  #hud{position:fixed;top:10px;right:10px;z-index:10;background:#0008;padding:8px 12px;border-radius:8px;font-size:13px}
+  #panel{position:fixed;right:10px;bottom:10px;z-index:10;background:var(--panel);padding:12px;border-radius:10px;max-width:320px;display:none}
+  #panel h3{margin:0 0 6px 0;font-size:16px}
+  #panel p{margin:0 0 8px 0;font-size:14px;line-height:1.4}
+  #panel img{max-width:100%;border-radius:6px;margin:6px 0}
+  #panel .close{margin-top:6px;background:#333}
+  canvas#c{display:block;width:100vw;height:100vh}
+  .spacer{width:8px;height:8px}
+  input[type="range"]{vertical-align:middle}
+</style>
+</head>
+<body>
+  <div id="toolbar">
+    <input id="file" type="file" accept=".glb,.gltf" title="Open local GLB/GLTF" />
+    <button id="btnTexOn">Tex ON</button>
+    <button id="btnTexOff">Tex OFF</button>
+    <button id="btnReset">Reset</button>
+    <button id="btnSnapshot">Snapshot</button>
+    <button id="btnMeasure">Measure</button>
+    <label id="sectionLabel" style="display:none">Section
+      <input id="sectionRange" type="range" min="-1" max="1" step="0.001" value="0" />
+    </label>
+    <select id="viewSelect" title="Camera views" style="display:none"></select>
+    <div class="spacer"></div>
+    <span id="status"></span>
+  </div>
+
+  <div id="hud">Ready</div>
+  <div id="panel">
+    <h3 id="annTitle">Annotation</h3>
+    <p id="annDesc"></p>
+    <div id="annImages"></div>
+    <button class="close" id="annClose">닫기</button>
+  </div>
+
+  <canvas id="c"></canvas>
+
+<script type="module">
+import * as THREE from './libs/three.module.js';
+import { OrbitControls } from './libs/OrbitControls.js';
+import { GLTFLoader }  from './libs/GLTFLoader.js';
+// Draco 압축 GLB 필요 시:
+// import { DRACOLoader } from './libs/DRACOLoader.js';
+
+const qs = new URLSearchParams(location.search);
+const EMBED = qs.get('embed') === '1';
+
+const canvas = document.getElementById('c');
+const hud = document.getElementById('hud');
+const statusEl = document.getElementById('status');
+const fileInput = document.getElementById('file');
+const btnTexOn = document.getElementById('btnTexOn');
+const btnTexOff = document.getElementById('btnTexOff');
+const btnReset = document.getElementById('btnReset');
+const btnSnapshot = document.getElementById('btnSnapshot');
+const btnMeasure = document.getElementById('btnMeasure');
+const sectionLabel = document.getElementById('sectionLabel');
+const sectionRange = document.getElementById('sectionRange');
+const viewSelect = document.getElementById('viewSelect');
+const panel = document.getElementById('panel');
+const annTitle = document.getElementById('annTitle');
+const annDesc = document.getElementById('annDesc');
+const annImages = document.getElementById('annImages');
+document.getElementById('annClose').onclick = ()=>{ panel.style.display='none'; };
+
+if (EMBED){
+  document.getElementById('toolbar').style.display='none';
+  hud.style.display='none';
+  panel.style.display='none';
+}
+
+const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, preserveDrawingBuffer:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.localClippingEnabled = true;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111111);
+
+const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.01, 5000);
+camera.position.set(0,1.2,2.5);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x222222, 1.1));
+const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+dir.position.set(1,1,1);
+scene.add(dir);
+
+let cfg = null, cfgBase = null;
+let model = null, pickable = [];
+let savedMaps = new WeakMap();
+let initialCam = camera.position.clone();
+let initialTarget = controls.target.clone();
+
+let measuring = false, pA = null;
+let markerGeom = new THREE.SphereGeometry(0.01, 16, 12);
+let markerMat = new THREE.MeshBasicMaterial({color:0xffcc00});
+let measureMarkers = [], measureLine = null;
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+
+let clipPlane = null, bbox = null;
+
+let annotationSprites = [];
+const spriteMat = new THREE.SpriteMaterial({ color: 0xffcc00 });
+
+function worldToUnit(d){ if (!cfg || !cfg.units) return d; const k = (cfg.units.world_to_unit ?? 1.0); return d * k; }
+function unitName(){ return (cfg && cfg.units && cfg.units.name) ? cfg.units.name : 'unit'; }
+function setHUD(msg){ hud.textContent = msg; }
+function addStatus(msg){ statusEl.textContent = msg; }
+
+/** ✅ 박스 기반 맞춰보기(원래 방식) + 여유 배율 (기본 2.0) */
+function fitToView(object, k = (cfg?.camera?.fitScale ?? 2.0)){
+  bbox = new THREE.Box3().setFromObject(object);
+  const center = bbox.getCenter(new THREE.Vector3());
+  const size   = bbox.getSize(new THREE.Vector3());
+  const radius = size.length() * 0.5 || 1.0;
+
+  const fov  = THREE.MathUtils.degToRad(camera.fov);
+  const dist = (radius / Math.tan(fov / 2)) * k;
+
+  // 시선 방향을 고정(+Z) → “중심이 돌아간다” 느낌 방지
+  const dir = new THREE.Vector3(0, 0, 1);
+
+  controls.target.copy(center);
+  camera.position.copy(center).addScaledVector(dir, dist);
+
+  camera.near = Math.max(dist / 1000, 0.01);
+  camera.far  = dist * 10 + 10;
+  camera.updateProjectionMatrix();
+
+  controls.minDistance = dist * 0.1;
+  controls.maxDistance = dist * 10;
+  controls.update();
+
+  initialCam.copy(camera.position);
+  initialTarget.copy(controls.target);
+}
+
+function setCamera(pos, target){
+  if(pos) camera.position.set(pos[0], pos[1], pos[2]);
+  if(target) controls.target.set(target[0], target[1], target[2]);
+  controls.update();
+}
+
+function disposeObject(root){
+  root.traverse(o=>{
+    if (o.geometry) o.geometry.dispose();
+    if (o.material){
+      if (Array.isArray(o.material)) o.material.forEach(m=>m.dispose());
+      else o.material.dispose();
+    }
+    if (o.isSprite && o.material) o.material.dispose();
+  });
+}
+
+/** ✅ 로드 + (선택) 재중심/정규화(기본 OFF) + 카메라 세팅(한 번만) */
+async function loadModel(url, initial = null){
+  try{
+    addStatus('Loading...');
+
+    if (model){ scene.remove(model); disposeObject(model); model=null; pickable=[]; }
+    measureClear(); clearAnnotations();
+
+    const loader = new GLTFLoader();
+    // Draco 쓰면 주석 해제:
+    // const draco = new DRACOLoader(); draco.setDecoderPath('./libs/draco/'); loader.setDRACOLoader(draco);
+
+    const gltf = await loader.loadAsync(url);
+    model = gltf.scene;
+    scene.add(model);
+    model.updateMatrixWorld(true);
+
+    // 피킹 대상 수집
+    pickable = [];
+    model.traverse(o=>{ if (o.isMesh) pickable.push(o); });
+
+    // (옵션) 재중심/정규화: 기본 OFF. 원하면 config.json에서 켜기
+    bbox = new THREE.Box3().setFromObject(model);
+    let center = bbox.getCenter(new THREE.Vector3());
+
+    if (cfg?.camera?.recenter === true){
+      model.position.sub(center);
+      model.updateMatrixWorld(true);
+      bbox.setFromObject(model);
+      center = bbox.getCenter(new THREE.Vector3());
+    }
+    if (cfg?.camera?.normalizeSize){
+      const size = bbox.getSize(new THREE.Vector3());
+      const longest = Math.max(size.x, size.y, size.z);
+      const target = Number(cfg.camera.normalizeSize); // 예: 1.0
+      if (longest > 0 && isFinite(target) && target > 0){
+        const s = target / longest;
+        model.scale.setScalar(s);
+        model.updateMatrixWorld(true);
+        bbox.setFromObject(model);
+      }
+    }
+
+    // ✅ 카메라: initial이 있으면 그 값, 없으면 fitToView(박스 기반) 딱 한 번만
+    if (initial && initial.pos && initial.target){
+      setCamera(initial.pos, initial.target);
+      initialCam.copy(camera.position);
+      initialTarget.copy(controls.target);
+    } else {
+      fitToView(model); // ← 박스 기반
+    }
+
+    addStatus('Loaded');
+  }catch(err){
+    console.error(err);
+    setHUD('Model load error');
+    addStatus('Load failed');
+  }
+}
+
+function toggleTextures(on){
+  scene.traverse(o=>{
+    if(!o.isMesh || !o.material) return;
+    const mats = Array.isArray(o.material) ? o.material : [o.material];
+    mats.forEach(m=>{
+      if(on){ if(savedMaps.has(m)){ m.map = savedMaps.get(m); m.needsUpdate = true; } }
+      else { if(!savedMaps.has(m)) savedMaps.set(m, m.map || null); m.map = null; m.needsUpdate = true; }
+    });
+  });
+}
+function snapshot(){
+  const url = renderer.domElement.toDataURL('image/png');
+  const a = document.createElement('a'); a.href=url; a.download='snapshot.png'; a.click();
+}
+
+function measureEnable(){ measuring = true; pA = null; controls.enabled = false; setHUD('측정 모드: 첫 점 클릭'); }
+function measureClear(){
+  measuring = false; pA = null; controls.enabled = true;
+  measureMarkers.forEach(m=>scene.remove(m)); measureMarkers = [];
+  if (measureLine){ scene.remove(measureLine); measureLine.geometry.dispose(); measureLine.material.dispose(); measureLine=null; }
+  setHUD('Ready');
+}
+function addMarker(p){ const m = new THREE.Mesh(markerGeom, markerMat); m.position.copy(p); scene.add(m); measureMarkers.push(m); }
+function drawLine(a,b){
+  if (measureLine){ scene.remove(measureLine); measureLine.geometry.dispose(); measureLine.material.dispose(); }
+  const g = new THREE.BufferGeometry().setFromPoints([a,b]);
+  const mat = new THREE.LineBasicMaterial({ color: 0xffffff });
+  measureLine = new THREE.Line(g, mat); scene.add(measureLine);
+}
+function pickPoint(ev, targets){
+  const rect = renderer.domElement.getBoundingClientRect();
+  ndc.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+  ndc.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(ndc, camera);
+  const hits = raycaster.intersectObjects(targets, true);
+  return hits.length ? hits[0].point.clone() : null;
+}
+renderer.domElement.addEventListener('pointerdown', (ev)=>{
+  const annHit = pickAnnotation(ev); if (annHit) { showAnnotation(annHit.object.userData); return; }
+  if (!measuring) return;
+  const p = pickPoint(ev, pickable);
+  if (!p){ setHUD('표면을 클릭하세요'); return; }
+  if (!pA){ pA = p; addMarker(p); setHUD('두 번째 점 클릭'); }
+  else { addMarker(p); drawLine(pA, p); const d = worldToUnit(pA.distanceTo(p)); setHUD(`거리: ${d.toFixed(3)} ${unitName()}`); measuring = false; controls.enabled = true; }
+});
+
+/** ✅ Section: 슬라이더 0이면 완전 OFF */
+function enableSection(axis='y'){
+  if (!bbox) bbox = new THREE.Box3().setFromObject(model);
+  if (!bbox) return;
+
+  let normal = new THREE.Vector3(0,1,0);
+  if (axis==='x') normal.set(1,0,0);
+  if (axis==='z') normal.set(0,0,1);
+
+  const center = bbox.getCenter(new THREE.Vector3());
+  const plane = new THREE.Plane(normal, -normal.dot(center));
+
+  sectionLabel.style.display = '';
+  sectionRange.value = '0';
+
+  sectionRange.oninput = ()=>{
+    const v = parseFloat(sectionRange.value); // -1..1
+    if (Math.abs(v) < 1e-6){
+      renderer.clippingPlanes = [];
+      renderer.localClippingEnabled = false;
+      return;
+    }
+    const size = bbox.getSize(new THREE.Vector3());
+    const half = (axis==='x'?size.x:(axis==='y'?size.y:size.z)) * 0.5;
+    const p = center.clone().addScaledVector(normal, v * half);
+    plane.constant = -normal.dot(p);
+    renderer.clippingPlanes = [plane];
+    renderer.localClippingEnabled = true;
+  };
+
+  // 초기값 0 즉시 반영 → 완전 OFF로 시작
+  sectionRange.dispatchEvent(new Event('input'));
+}
+function disableSection(){ renderer.clippingPlanes = []; clipPlane = null; sectionLabel.style.display = 'none'; }
+
+function clearAnnotations(){ annotationSprites.forEach(s=>scene.remove(s)); annotationSprites = []; panel.style.display='none'; }
+function addAnnotationPin(a){
+  const s = new THREE.Sprite(spriteMat.clone());
+  s.position.set(a.pos[0], a.pos[1], a.pos[2]); s.scale.set(0.04, 0.04, 0.04);
+  s.userData = a; scene.add(s); annotationSprites.push(s);
+}
+function pickAnnotation(ev){
+  if (!annotationSprites.length) return null;
+  const rect = renderer.domElement.getBoundingClientRect();
+  ndc.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+  ndc.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(ndc, camera);
+  const hits = raycaster.intersectObjects(annotationSprites, true);
+  return hits.length ? hits[0] : null;
+}
+function showAnnotation(a){
+  annTitle.textContent = a.label || 'Annotation';
+  annDesc.textContent = a.desc || '';
+  annImages.innerHTML = '';
+  if (a.images && a.images.length){
+    for(const img of a.images){
+      const src = cfgBase ? new URL(img, cfgBase).href : img;
+      const el = document.createElement('img'); el.src = src; annImages.appendChild(el);
+    }
+  }
+  panel.style.display = 'block';
+}
+
+btnTexOn.onclick = ()=>toggleTextures(true);
+btnTexOff.onclick = ()=>toggleTextures(false);
+btnReset.onclick = ()=>{ camera.position.copy(initialCam); controls.target.copy(initialTarget); controls.update(); setHUD('Ready'); };
+btnSnapshot.onclick = snapshot;
+btnMeasure.onclick = ()=>{ if (!measuring) measureEnable(); else measureClear(); };
+
+fileInput.addEventListener('change', async (e)=>{
+  const file = e.target.files?.[0]; if(!file) return;
+  const url = URL.createObjectURL(file); await loadModel(url, null);
+});
+
+addEventListener('resize', ()=>{
+  camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+(function animate(){ requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); })();
+
+async function boot(){
+  const cfgUrl = qs.get('cfg');
+  const src = qs.get('src');
+
+  if (cfgUrl){
+    try{
+      const res = await fetch(cfgUrl);
+      cfg = await res.json();
+      cfgBase = new URL(cfgUrl, location.href);
+
+      const assetURL = cfg.asset ? new URL(cfg.asset, cfgBase).href : null;
+      await loadModel(assetURL, cfg.initial || null);
+
+      if (cfg.views && cfg.views.length){
+        viewSelect.style.display='';
+        viewSelect.innerHTML = '<option value="">Views</option>' +
+          cfg.views.map((v,i)=>`<option value="${i}">${v.label||v.id||('View '+(i+1))}</option>`).join('');
+        viewSelect.onchange = ()=>{
+          const v = cfg.views[parseInt(viewSelect.value)]; if (!v) return;
+          setCamera(v.pos, v.target);
+        };
+      }
+      if (cfg.ui && cfg.ui.section){ enableSection(cfg.ui.sectionAxis || 'y'); }
+      if (cfg.annotations && cfg.annotations.length){ for(const a of cfg.annotations) addAnnotationPin(a); }
+      setHUD('Ready (config)');
+    }catch(e){ console.error(e); setHUD('Config load error'); }
+  } else if (src){
+    await loadModel(src, null); setHUD('Ready (src)');
+  } else {
+    setHUD('Ready (local file: GLB/GLTF)');
+  }
+}
+boot();
+</script>
+</body>
+</html>
