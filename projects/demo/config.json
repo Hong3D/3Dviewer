@@ -1,0 +1,11 @@
+{
+  "title": "안동하회탈",
+  "asset": "asset/Mask.glb",
+  "camera": { "fitScale": 2.0 },
+  "views": [
+    { "id": "front", "label": "정면", "pos": [0, 0.8, 2.0], "target": [0, 0.3, 0] }
+  ],
+  "ui": { "textureToggle": true, "snapshot": true, "section": true, "sectionAxis": "y", "measure": "distance" },
+  "units": { "name": "mm", "world_to_unit": 1.0 },
+  "annotations": []
+}
